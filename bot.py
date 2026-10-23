@@ -33,7 +33,7 @@ API_URL = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/v
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ALLOWED_USERS = {int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USERS", "")) if x.strip()}
-POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "30")))
+POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "1")))
 MAX_QUOTE_AGE = int(os.getenv("MAX_QUOTE_AGE_SECONDS", "900"))  # котировки старше — игнорируем
 DATA_FILE = Path(os.getenv("DATA_FILE", "settings.json"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))   # что уже алертили — чтобы не дублировать после рестарта

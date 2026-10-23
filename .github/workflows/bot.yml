@@ -39,6 +39,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          POLL_SECONDS: "1"
         run: |
           # Штатно выходим за ~10 минут до лимита job, чтобы успеть сохранить настройки
           export RUN_UNTIL=$(( $(date +%s) + 20400 ))

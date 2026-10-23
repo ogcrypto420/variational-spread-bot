@@ -1,0 +1,25 @@
+name: Dump API (debug)
+
+# Служебный: сохраняет полный ответ API Variational в ветку debug-data,
+# чтобы сверить расчёты бота с реальными данными.
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch and push
+        run: |
+          mkdir out && cd out
+          BASE=https://omni-client-api.prod.ap-northeast-1.variational.io
+          curl -sS "$BASE/metadata/v2/stats" -o stats_v2.json
+          sleep 2
+          curl -sS "$BASE/metadata/stats" -o stats_v1.json
+          date -u +%Y-%m-%dT%H:%M:%SZ > fetched_at.txt
+          git init -q -b debug-data
+          git add .
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "API dump"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" debug-data

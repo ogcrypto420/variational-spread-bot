@@ -10,7 +10,9 @@ Telegram-бот: следит за всеми рынками Variational Omni и
 1. Создай бота у [@BotFather](https://t.me/BotFather), скопируй токен. Свой id узнай у [@userinfobot](https://t.me/userinfobot).
 2. В репозитории: **Settings → Secrets and variables → Actions → New repository secret**:
    - `BOT_TOKEN` — токен бота
-   - `ALLOWED_USERS` — твой Telegram id
+   - `ALLOWED_USERS` — необязательно. Не создавай этот секрет, если бот должен быть публичным:
+     тогда им может пользоваться кто угодно, у каждого свои фильтры. Если указать id через
+     запятую, доступ будет только у них.
 3. **Actions → Spread bot → Run workflow**.
 4. Напиши боту `/start`.
 

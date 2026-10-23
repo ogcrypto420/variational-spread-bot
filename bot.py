@@ -22,6 +22,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
@@ -297,7 +298,10 @@ HELP = """<b>Бот низкого спреда на Variational Omni</b>
 /cooldown 30 — минут между повторами по паре
 /scan — что подходит прямо сейчас
 /settings — текущие фильтры
-/on, /off — включить / выключить алерты"""
+/on, /off — включить / выключить алерты
+/stop — отписаться и удалить настройки
+
+У каждого пользователя свои фильтры."""
 
 
 def allowed(m: Message) -> bool:
@@ -431,7 +435,17 @@ async def cmd_scan(m: Message):
     await send_scan(m, get_st(m.chat.id))
 
 
-@dp.message(F.text)
+@dp.message(Command("stop"))
+async def cmd_stop(m: Message):
+    settings.pop(m.chat.id, None)
+    runtime.pop(m.chat.id, None)
+    save_settings()
+    save_state()
+    await m.answer("Отписал тебя от алертов, настройки удалены. /start — начать заново.")
+
+
+# Свободный текст — только в личке, чтобы в группах бот не отвечал на всё подряд
+@dp.message(F.text, F.chat.type == "private")
 async def free_text(m: Message):
     if not allowed(m):
         return
@@ -496,8 +510,16 @@ async def process_alerts():
         more = f"\n…и ещё {len(fresh) - 15}" if len(fresh) > 15 else ""
         try:
             await bot.send_message(chat_id, f"🔔 <b>Низкий спред</b> ({len(fresh)})\n\n{body}{more}")
+        except TelegramForbiddenError:
+            # пользователь заблокировал бота — больше ему не пишем
+            log.info("Чат %s заблокировал бота, удаляю", chat_id)
+            settings.pop(chat_id, None)
+            runtime.pop(chat_id, None)
+            save_settings()
+            save_state()
         except Exception as e:  # noqa: BLE001
             log.warning("Не отправил в %s: %s", chat_id, e)
+        await asyncio.sleep(0.05)  # не упираться в лимиты Telegram при многих пользователях
 
 
 async def main():
@@ -505,7 +527,7 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("Укажи BOT_TOKEN в файле .env")
     if not ALLOWED_USERS:
-        log.warning("ALLOWED_USERS пуст — ботом может пользоваться кто угодно")
+        log.info("Публичный режим: ботом может пользоваться любой, у каждого свои фильтры")
     load_settings()
     load_state()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))

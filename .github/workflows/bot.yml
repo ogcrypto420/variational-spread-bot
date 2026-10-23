@@ -1,0 +1,59 @@
+name: Spread bot
+
+# Бот работает сеансами ~5ч40м. Расписание каждые 30 минут держит в очереди
+# следующий запуск: как только текущий завершится (штатно или из-за падения),
+# очередной стартует сам. Одновременно работает только один экземпляр.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: spread-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore settings
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            settings.json
+            state.json
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+        run: |
+          # Штатно выходим за ~10 минут до лимита job, чтобы успеть сохранить настройки
+          export RUN_UNTIL=$(( $(date +%s) + 20400 ))
+          # Если бот упал — перезапускаем его внутри того же сеанса
+          while [ "$(date +%s)" -lt "$RUN_UNTIL" ]; do
+            if python bot.py; then break; fi
+            echo "Бот упал, перезапуск через 15 секунд"
+            sleep 15
+          done
+
+      - name: Save settings
+        if: always() && hashFiles('settings.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            settings.json
+            state.json
+          key: bot-state-${{ github.run_id }}-${{ github.run_attempt }}

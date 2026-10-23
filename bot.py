@@ -35,6 +35,8 @@ ALLOWED_USERS = {int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USERS", 
 POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "30")))
 MAX_QUOTE_AGE = int(os.getenv("MAX_QUOTE_AGE_SECONDS", "900"))  # котировки старше — игнорируем
 DATA_FILE = Path(os.getenv("DATA_FILE", "settings.json"))
+STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))   # что уже алертили — чтобы не дублировать после рестарта
+RUN_UNTIL = float(os.getenv("RUN_UNTIL", "0") or 0)          # unix-время, когда штатно завершиться (для GitHub Actions)
 
 DEFAULTS = {
     "enabled": True,
@@ -83,9 +85,27 @@ def get_st(chat_id: int) -> dict:
     return settings[chat_id]
 
 
+def load_state() -> None:
+    if STATE_FILE.exists():
+        try:
+            raw = json.loads(STATE_FILE.read_text("utf-8"))
+            for k, v in raw.items():
+                runtime[int(k)] = {"active": set(v.get("active", [])), "last_alert": dict(v.get("last_alert", {}))}
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не смог прочитать %s: %s", STATE_FILE, e)
+
+
+def save_state() -> None:
+    data = {str(k): {"active": sorted(v["active"]), "last_alert": v["last_alert"]} for k, v in runtime.items()}
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), "utf-8")
+    tmp.replace(STATE_FILE)
+
+
 def reset_runtime(chat_id: int) -> None:
     """После смены фильтров заново алертим всё, что подходит."""
     runtime[chat_id] = {"active": set(), "last_alert": {}}
+    save_state()
 
 
 # ---------------------------------------------------------------- parsing
@@ -464,11 +484,14 @@ async def process_alerts():
         fresh = [r for r in res
                  if r["ticker"] not in rt["active"]
                  and now - rt["last_alert"].get(r["ticker"], 0) >= st["cooldown_min"] * 60]
+        changed = current != rt["active"]
         rt["active"] = current
-        if not fresh:
-            continue
         for r in fresh:
             rt["last_alert"][r["ticker"]] = now
+        if changed or fresh:
+            save_state()
+        if not fresh:
+            continue
         body = "\n".join(fmt_row(r) for r in fresh[:15])
         more = f"\n…и ещё {len(fresh) - 15}" if len(fresh) > 15 else ""
         try:
@@ -484,10 +507,21 @@ async def main():
     if not ALLOWED_USERS:
         log.warning("ALLOWED_USERS пуст — ботом может пользоваться кто угодно")
     load_settings()
+    load_state()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     asyncio.create_task(poller())
+    if RUN_UNTIL:
+        asyncio.create_task(stop_at_deadline())
     log.info("Бот запущен, опрос каждые %sс", POLL_SECONDS)
     await dp.start_polling(bot)
+    log.info("Бот остановлен")
+
+
+async def stop_at_deadline():
+    """Штатно выходим до лимита GitHub Actions, чтобы следующий запуск подхватил работу."""
+    await asyncio.sleep(max(0.0, RUN_UNTIL - time.time()))
+    log.info("Плановый перезапуск")
+    await dp.stop_polling()
 
 
 if __name__ == "__main__":

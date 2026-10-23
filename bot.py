@@ -45,6 +45,7 @@ DEFAULTS = {
     "min_oi": 0.0,             # $
     "min_volume": 0.0,         # $ за 24ч
     "max_spread_pct": 0.03,    # в процентах: 0.03 = 0.03%
+    "spread_mode": "site",     # site — как на сайте Variational (половина bid-ask), full — полный bid-ask
     "size": "base",            # base | 1k | 100k | 1m
     "types": "all",            # all | perp | swap
     "cooldown_min": 30,        # не повторять алерт по той же паре чаще
@@ -219,6 +220,13 @@ def spread_pct(listing: dict, size: str) -> float | None:
     return (ask - bid) / ((ask + bid) / 2) * 100
 
 
+def eff_spread(full: float | None, st: dict) -> float | None:
+    """Спред, по которому фильтруем: как на сайте (половина bid-ask) или полный."""
+    if full is None:
+        return None
+    return full / 2 if st.get("spread_mode", "site") == "site" else full
+
+
 def total_oi(listing: dict) -> float:
     oi = listing.get("open_interest") or {}
     return fnum(oi.get("long_open_interest")) + fnum(oi.get("short_open_interest"))
@@ -238,13 +246,14 @@ def matches(listings: list[dict], st: dict) -> list[dict]:
         vol = fnum(l.get("volume_24h"))
         if vol < st["min_volume"]:
             continue
-        sp = spread_pct(l, st["size"])
+        full = spread_pct(l, st["size"])
+        sp = eff_spread(full, st)
         if sp is None or sp > st["max_spread_pct"]:
             continue
         age = quote_age_s(l)
         if age is not None and age > MAX_QUOTE_AGE:
             continue
-        out.append({"ticker": l.get("ticker", "?"), "spread": sp, "oi": oi, "vol": vol,
+        out.append({"ticker": l.get("ticker", "?"), "spread": sp, "full": full, "oi": oi, "vol": vol,
                     "price": l.get("mark_price"), "age": age, "listing": l})
     out.sort(key=lambda r: r["spread"])
     return out
@@ -261,7 +270,7 @@ def usd(x: float) -> str:
 def fmt_row(r: dict) -> str:
     oi = r["listing"].get("open_interest") or {}
     age = f" · котир. {int(r['age'])}с назад" if r["age"] is not None else ""
-    return (f"<b>{r['ticker']}</b> — спред <b>{r['spread']:.4f}%</b>\n"
+    return (f"<b>{r['ticker']}</b> — спред <b>{r['spread']:.4f}%</b> (bid-ask {r['full']:.4f}%)\n"
             f"   OI {usd(r['oi'])} (L {usd(fnum(oi.get('long_open_interest')))} / "
             f"S {usd(fnum(oi.get('short_open_interest')))}) · объём 24ч {usd(r['vol'])}{age}")
 
@@ -271,7 +280,8 @@ def fmt_settings(st: dict) -> str:
     types = {"all": "все", "perp": "только PERP", "swap": "только SWAP"}[st["types"]]
     return (f"{'🟢 Алерты включены' if st['enabled'] else '🔴 Алерты выключены'}\n"
             f"OI: {oi}\n"
-            f"Спред: ≤ {st['max_spread_pct']:g}% (≈ {st['max_spread_pct'] * 100:g} bps)\n"
+            f"Спред: ≤ {st['max_spread_pct']:g}% "
+            f"({'как на сайте' if st.get('spread_mode', 'site') == 'site' else 'полный bid-ask'})\n"
             f"Размер котировки: {st['size']}\n"
             f"Мин. объём 24ч: {usd(st['min_volume'])}\n"
             f"Рынки: {types}\n"
@@ -294,6 +304,7 @@ HELP = """<b>Бот низкого спреда на Variational Omni</b>
 /spread 0.02 — макс. спред в % (или 2bps)
 /vol 10k — мин. объём за 24ч
 /size base — котировка: base, 1k, 100k, 1m
+/mode site — спред как на сайте (site) или полный bid-ask (full)
 /type all — all, perp или swap
 /cooldown 30 — минут между повторами по паре
 /scan — что подходит прямо сейчас
@@ -401,6 +412,17 @@ async def cmd_type(m: Message, command: CommandObject):
     await apply_changes(m, {"types": v})
 
 
+@dp.message(Command("mode"))
+async def cmd_mode(m: Message, command: CommandObject):
+    if not allowed(m):
+        return
+    v = (command.args or "").strip().lower()
+    if v not in ("site", "full"):
+        return await m.answer("Варианты:\n/mode site — спред как на сайте Variational (по умолчанию)\n"
+                              "/mode full — полный спред bid-ask (в 2 раза больше)")
+    await apply_changes(m, {"spread_mode": v})
+
+
 @dp.message(Command("cooldown"))
 async def cmd_cooldown(m: Message, command: CommandObject):
     if not allowed(m):
@@ -453,11 +475,11 @@ def pair_report(l: dict, st: dict) -> str:
              f"Объём 24ч: {usd(vol)}",
              f"Котировки обновлены: {int(age)}с назад" if age is not None else "Котировок нет",
              "",
-             "Спред по размерам:"]
+             "Спред по размерам (как на сайте / полный bid-ask):"]
     for size in SIZE_KEYS:
         sp = spread_pct(l, size)
         mark = " ← считаю по нему" if size == st["size"] else ""
-        lines.append(f"  {size}: {sp:.4f}%{mark}" if sp is not None else f"  {size}: нет котировки{mark}")
+        lines.append(f"  {size}: {sp / 2:.4f}% / {sp:.4f}%{mark}" if sp is not None else f"  {size}: нет котировки{mark}")
 
     reasons = []
     ct = l.get("contract_type")
@@ -469,7 +491,7 @@ def pair_report(l: dict, st: dict) -> str:
         reasons.append(f"OI {usd(total)} меньше минимума {usd(st['min_oi'])}")
     if vol < st["min_volume"]:
         reasons.append(f"объём {usd(vol)} меньше минимума {usd(st['min_volume'])}")
-    sp = spread_pct(l, st["size"])
+    sp = eff_spread(spread_pct(l, st["size"]), st)
     if sp is None:
         reasons.append(f"нет котировки размера {st['size']}")
     elif sp > st["max_spread_pct"]:

@@ -297,6 +297,7 @@ HELP = """<b>Бот низкого спреда на Variational Omni</b>
 /type all — all, perp или swap
 /cooldown 30 — минут между повторами по паре
 /scan — что подходит прямо сейчас
+/pair BCH — данные по паре и почему она не проходит фильтр (или просто напиши тикер)
 /settings — текущие фильтры
 /on, /off — включить / выключить алерты
 /stop — отписаться и удалить настройки
@@ -435,6 +436,73 @@ async def cmd_scan(m: Message):
     await send_scan(m, get_st(m.chat.id))
 
 
+def find_listings(query: str) -> list[dict]:
+    q = query.strip().upper().replace("/", "").replace("$", "")
+    exact = [l for l in last_listings if l.get("ticker", "").upper().split("-")[0] == q]
+    return exact or [l for l in last_listings if l.get("ticker", "").upper().startswith(q)][:5]
+
+
+def pair_report(l: dict, st: dict) -> str:
+    oi = l.get("open_interest") or {}
+    total = total_oi(l)
+    vol = fnum(l.get("volume_24h"))
+    age = quote_age_s(l)
+    lines = [f"📊 <b>{l.get('ticker')}</b> ({l.get('name', '')})",
+             f"Цена: {l.get('mark_price')}",
+             f"OI: {usd(total)} (L {usd(fnum(oi.get('long_open_interest')))} / S {usd(fnum(oi.get('short_open_interest')))})",
+             f"Объём 24ч: {usd(vol)}",
+             f"Котировки обновлены: {int(age)}с назад" if age is not None else "Котировок нет",
+             "",
+             "Спред по размерам:"]
+    for size in SIZE_KEYS:
+        sp = spread_pct(l, size)
+        mark = " ← считаю по нему" if size == st["size"] else ""
+        lines.append(f"  {size}: {sp:.4f}%{mark}" if sp is not None else f"  {size}: нет котировки{mark}")
+
+    reasons = []
+    ct = l.get("contract_type")
+    if (st["types"] == "perp" and ct != "perpetual") or (st["types"] == "swap" and ct != "swap"):
+        reasons.append(f"тип рынка {ct}, а в фильтре {st['types']}")
+    if total > st["max_oi"]:
+        reasons.append(f"OI {usd(total)} больше лимита {usd(st['max_oi'])}")
+    if total < st["min_oi"]:
+        reasons.append(f"OI {usd(total)} меньше минимума {usd(st['min_oi'])}")
+    if vol < st["min_volume"]:
+        reasons.append(f"объём {usd(vol)} меньше минимума {usd(st['min_volume'])}")
+    sp = spread_pct(l, st["size"])
+    if sp is None:
+        reasons.append(f"нет котировки размера {st['size']}")
+    elif sp > st["max_spread_pct"]:
+        reasons.append(f"спред {sp:.4f}% больше лимита {st['max_spread_pct']:g}%")
+    if age is not None and age > MAX_QUOTE_AGE:
+        reasons.append(f"котировка устарела ({int(age // 60)} мин)")
+    lines.append("")
+    lines.append("✅ Проходит фильтр" if not reasons else "❌ Не проходит: " + "; ".join(reasons))
+    return "\n".join(lines)
+
+
+async def send_pair(m: Message, query: str) -> bool:
+    found = find_listings(query)
+    if not found:
+        return False
+    st = get_st(m.chat.id)
+    for l in found[:3]:
+        await m.answer(pair_report(l, st))
+    return True
+
+
+@dp.message(Command("pair"))
+async def cmd_pair(m: Message, command: CommandObject):
+    if not allowed(m):
+        return
+    if not command.args:
+        return await m.answer("Пример: /pair BCH")
+    if not last_listings:
+        return await m.answer("Данные ещё не загружены, подожди пару секунд.")
+    if not await send_pair(m, command.args):
+        await m.answer(f"Пары «{command.args}» нет в API Variational.")
+
+
 @dp.message(Command("stop"))
 async def cmd_stop(m: Message):
     settings.pop(m.chat.id, None)
@@ -454,7 +522,11 @@ async def free_text(m: Message):
     except ValueError:
         changes = {}
     if not changes:
-        return await m.answer("Не понял фильтр 🤔 Напиши, например: <i>OI до 300к, спред 0.02</i>\n/help — все команды")
+        # просто тикер («BCH») — показываем инфу по паре
+        if re.fullmatch(r"[A-Za-z0-9$/-]{2,15}", m.text.strip()) and last_listings and await send_pair(m, m.text):
+            return
+        return await m.answer("Не понял фильтр 🤔 Напиши, например: <i>OI до 300к, спред 0.02</i>\n"
+                              "Или тикер, например <i>BCH</i>, — покажу данные по паре.\n/help — все команды")
     await apply_changes(m, changes)
 
 

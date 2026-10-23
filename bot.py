@@ -50,7 +50,7 @@ DEFAULTS = {
     "max_spread_pct": 0.03,    # в процентах: 0.03 = 0.03%
     "spread_mode": "site",     # site — как на сайте Variational (половина bid-ask), full — полный bid-ask
     "size": "base",            # base | 1k | 100k | 1m
-    "types": "all",            # all | perp | swap
+    "types": "all",            # all | crypto | tradfi | perp | swap
     "cooldown_min": 30,        # не повторять алерт по той же паре чаще
     "defaults_v": 2,
 }
@@ -233,6 +233,10 @@ def parse_free_text(text: str) -> dict:
     vol_m = re.search(rf"(?:объ[её]м\w*|volume)\D{{0,15}}?({NUM_RE})", t)
     if vol_m:
         changes["min_volume"] = parse_money(vol_m.group(1))
+    if re.search(r"только\s+крипт|крипт\w*\s+только|only\s+crypto|crypto\s+only|без\s+акци", t):
+        changes["types"] = "crypto"
+    elif re.search(r"(все|любые)\s+рынк|all\s+markets", t):
+        changes["types"] = "all"
     return changes
 
 
@@ -276,6 +280,53 @@ def eff_spread(full: float | None, st: dict) -> float | None:
     return full / 2 if st.get("spread_mode", "site") == "site" else full
 
 
+# ---- крипта или нет: в API нет категории, определяем по тикеру и названию
+NON_CRYPTO_TICKERS = {
+    # металлы, сырьё, токены на золото
+    "XAU", "XAG", "XPT", "XPD", "COPPER", "CL", "BZ", "NATGAS", "PAXG", "XAUT",
+    # pre-IPO компании
+    "OPENAI", "ANTHROPIC", "SPACEX", "XAI", "STRIPE", "DATABRICKS",
+}
+CRYPTO_TICKERS = {"TWT", "GIGGLE"}   # криптотокены, чьё название похоже на компанию/фонд
+CORP_RE = re.compile(
+    r"\b(inc|corp|corporation|company|co|holdings?|limited|ltd|group|plc|n\.v|s\.a|s\.p\.a|a/s|oyj|ag|se|"
+    r"etf|trust|fund|incorporated|common stock|depositary)\b", re.I)
+COMMODITY_RE = re.compile(r"^(gold|silver|platinum|palladium|copper|natural gas|cocoa|.*\b(crude )?oil)$", re.I)
+_crypto_cache: dict[tuple, bool] = {}
+
+
+def is_crypto(listing: dict) -> bool:
+    key = (listing.get("ticker", ""), listing.get("name", ""), listing.get("contract_type"))
+    if key not in _crypto_cache:
+        base = key[0].rsplit("-", 1)[0].upper()
+        if key[2] == "swap":
+            res = False
+        elif base in CRYPTO_TICKERS:
+            res = True
+        elif base in NON_CRYPTO_TICKERS:
+            res = False
+        else:
+            name = key[1].strip()
+            res = not (CORP_RE.search(name) or COMMODITY_RE.match(name))
+        _crypto_cache[key] = res
+    return _crypto_cache[key]
+
+
+def type_ok(listing: dict, types: str) -> bool:
+    ct = listing.get("contract_type")
+    return {
+        "all": True,
+        "perp": ct == "perpetual",
+        "swap": ct == "swap",
+        "crypto": is_crypto(listing),
+        "tradfi": not is_crypto(listing),
+    }.get(types, True)
+
+
+TYPE_LABELS = {"all": "все", "crypto": "только крипта", "tradfi": "только акции/сырьё/индексы",
+               "perp": "только PERP", "swap": "только SWAP"}
+
+
 def total_oi(listing: dict) -> float:
     oi = listing.get("open_interest") or {}
     return fnum(oi.get("long_open_interest")) + fnum(oi.get("short_open_interest"))
@@ -284,10 +335,7 @@ def total_oi(listing: dict) -> float:
 def matches(listings: list[dict], st: dict) -> list[dict]:
     out = []
     for l in listings:
-        ct = l.get("contract_type")
-        if st["types"] == "perp" and ct != "perpetual":
-            continue
-        if st["types"] == "swap" and ct != "swap":
+        if not type_ok(l, st["types"]):
             continue
         oi = total_oi(l)
         if oi > st["max_oi"] or oi < st["min_oi"]:
@@ -326,7 +374,7 @@ def fmt_row(r: dict) -> str:
 
 def fmt_settings(st: dict) -> str:
     oi = f"{usd(st['min_oi'])} – {usd(st['max_oi'])}" if st["min_oi"] > 0 else f"до {usd(st['max_oi'])}"
-    types = {"all": "все", "perp": "только PERP", "swap": "только SWAP"}[st["types"]]
+    types = TYPE_LABELS.get(st["types"], st["types"])
     return (f"{'🟢 Алерты включены' if st['enabled'] else '🔴 Алерты выключены'}\n"
             f"OI: {oi}\n"
             f"Спред: ≤ {st['max_spread_pct']:g}% "
@@ -354,7 +402,7 @@ HELP = """<b>Бот низкого спреда на Variational Omni</b>
 /vol 10k — мин. объём за 24ч
 /size base — котировка: base, 1k, 100k, 1m
 /mode site — спред как на сайте (site) или полный bid-ask (full)
-/type all — all, perp или swap
+/type crypto — только криптовалюта (all — все, tradfi — акции/сырьё)
 /cooldown 30 — минут между повторами по паре
 /scan — что подходит прямо сейчас
 /pair BCH — данные по паре и почему она не проходит фильтр (или просто напиши тикер)
@@ -516,8 +564,10 @@ async def cmd_type(m: Message, command: CommandObject):
     if not allowed(m):
         return
     v = (command.args or "").strip().lower()
-    if v not in ("all", "perp", "swap"):
-        return await m.answer("Варианты: /type all, /type perp, /type swap")
+    v = {"крипта": "crypto", "crypto": "crypto", "все": "all"}.get(v, v)
+    if v not in TYPE_LABELS:
+        return await m.answer("Варианты:\n/type crypto — только криптовалюта\n/type tradfi — только акции, сырьё, индексы\n"
+                              "/type all — все рынки\n/type perp или /type swap — по типу контракта")
     await apply_changes(m, {"types": v})
 
 
@@ -579,6 +629,7 @@ def pair_report(l: dict, st: dict) -> str:
     vol = fnum(l.get("volume_24h"))
     age = quote_age_s(l)
     lines = [f"📊 <b>{l.get('ticker')}</b> ({l.get('name', '')})",
+             f"Категория: {'криптовалюта' if is_crypto(l) else 'акции / сырьё / индексы'}",
              f"Цена: {l.get('mark_price')}",
              f"OI: {usd(total)} (L {usd(fnum(oi.get('long_open_interest')))} / S {usd(fnum(oi.get('short_open_interest')))})",
              f"Объём 24ч: {usd(vol)}",
@@ -592,8 +643,9 @@ def pair_report(l: dict, st: dict) -> str:
 
     reasons = []
     ct = l.get("contract_type")
-    if (st["types"] == "perp" and ct != "perpetual") or (st["types"] == "swap" and ct != "swap"):
-        reasons.append(f"тип рынка {ct}, а в фильтре {st['types']}")
+    if not type_ok(l, st["types"]):
+        kind = "криптовалюта" if is_crypto(l) else "не крипта (акции/сырьё/индексы)"
+        reasons.append(f"это {kind}, а в фильтре «{TYPE_LABELS.get(st['types'], st['types'])}»")
     if total > st["max_oi"]:
         reasons.append(f"OI {usd(total)} больше лимита {usd(st['max_oi'])}")
     if total < st["min_oi"]:

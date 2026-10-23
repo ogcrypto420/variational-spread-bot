@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -36,12 +36,15 @@ ALLOWED_USERS = {int(x) for x in re.split(r"[,\s]+", os.getenv("ALLOWED_USERS", 
 POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "1")))
 MAX_QUOTE_AGE = int(os.getenv("MAX_QUOTE_AGE_SECONDS", "900"))  # котировки старше — игнорируем
 DATA_FILE = Path(os.getenv("DATA_FILE", "settings.json"))
-STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))   # что уже алертили — чтобы не дублировать после рестарта
+STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
+STATS_FILE = Path(os.getenv("STATS_FILE", "stats.json"))    # статистика для владельца (/stats)
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", os.getenv("ADMIN_ID", "")) if x.strip()}
+TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "3"))))  # для «сегодня» в статистике (МСК)   # что уже алертили — чтобы не дублировать после рестарта
 RUN_UNTIL = float(os.getenv("RUN_UNTIL", "0") or 0)          # unix-время, когда штатно завершиться (для GitHub Actions)
 
 DEFAULTS = {
     "enabled": True,
-    "max_oi": 500_000.0,       # $
+    "max_oi": 1_000_000.0,     # $
     "min_oi": 0.0,             # $
     "min_volume": 0.0,         # $ за 24ч
     "max_spread_pct": 0.03,    # в процентах: 0.03 = 0.03%
@@ -49,6 +52,7 @@ DEFAULTS = {
     "size": "base",            # base | 1k | 100k | 1m
     "types": "all",            # all | perp | swap
     "cooldown_min": 30,        # не повторять алерт по той же паре чаще
+    "defaults_v": 2,
 }
 
 SIZE_KEYS = {"base": "base", "1k": "size_1k", "100k": "size_100k", "1m": "size_1m"}
@@ -62,6 +66,9 @@ settings: dict[int, dict] = {}
 runtime: dict[int, dict] = {}   # {chat_id: {"active": set, "last_alert": {ticker: ts}}}
 last_listings: list[dict] = []
 last_fetch_ts: float = 0.0
+STARTED_AT = time.time()
+session_stats = {"api_ok": 0, "api_err": 0, "last_err": ""}
+stats: dict = {"users": {}, "alerts_total": 0, "alerts_by_day": {}, "alerts_by_ticker": {}, "blocked": 0}
 
 
 def load_settings() -> None:
@@ -69,6 +76,9 @@ def load_settings() -> None:
         try:
             raw = json.loads(DATA_FILE.read_text("utf-8"))
             for k, v in raw.items():
+                if v.get("max_oi") == 500_000.0 and not v.get("defaults_v"):
+                    v["max_oi"] = DEFAULTS["max_oi"]   # старый дефолт 500k -> новый 1M
+                v["defaults_v"] = 2
                 settings[int(k)] = {**DEFAULTS, **v}
         except Exception as e:  # noqa: BLE001
             log.warning("Не смог прочитать %s: %s", DATA_FILE, e)
@@ -108,6 +118,45 @@ def reset_runtime(chat_id: int) -> None:
     """После смены фильтров заново алертим всё, что подходит."""
     runtime[chat_id] = {"active": set(), "last_alert": {}}
     save_state()
+
+
+def load_stats() -> None:
+    if STATS_FILE.exists():
+        try:
+            stats.update(json.loads(STATS_FILE.read_text("utf-8")))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не смог прочитать %s: %s", STATS_FILE, e)
+
+
+def save_stats() -> None:
+    tmp = STATS_FILE.with_suffix(".stmp")
+    tmp.write_text(json.dumps(stats, ensure_ascii=False), "utf-8")
+    tmp.replace(STATS_FILE)
+
+
+def today() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def touch_user(m: Message) -> None:
+    """Запоминаем пользователя для статистики."""
+    u = m.from_user
+    if not u:
+        return
+    rec = stats["users"].setdefault(str(m.chat.id), {"joined": time.time()})
+    rec.update({"name": u.full_name, "username": u.username or "", "last_seen": time.time()})
+    save_stats()
+
+
+def count_alert(tickers: list[str]) -> None:
+    d = today()
+    stats["alerts_total"] += 1
+    stats["alerts_by_day"][d] = stats["alerts_by_day"].get(d, 0) + 1
+    for t in tickers:
+        stats["alerts_by_ticker"][t] = stats["alerts_by_ticker"].get(t, 0) + 1
+    for k in sorted(stats["alerts_by_day"])[:-60]:   # храним 60 последних дней
+        del stats["alerts_by_day"][k]
+    save_stats()
 
 
 # ---------------------------------------------------------------- parsing
@@ -317,7 +366,67 @@ HELP = """<b>Бот низкого спреда на Variational Omni</b>
 
 
 def allowed(m: Message) -> bool:
-    return not ALLOWED_USERS or (m.from_user and m.from_user.id in ALLOWED_USERS)
+    ok = not ALLOWED_USERS or (m.from_user and m.from_user.id in ALLOWED_USERS)
+    if ok:
+        touch_user(m)
+    return ok
+
+
+def fmt_ago(ts: float) -> str:
+    s = int(time.time() - ts)
+    if s < 60:
+        return f"{s}с"
+    if s < 3600:
+        return f"{s // 60}м"
+    if s < 86400:
+        return f"{s // 3600}ч {s % 3600 // 60}м"
+    return f"{s // 86400}д"
+
+
+def fmt_stats() -> str:
+    now = time.time()
+    users = stats["users"]
+    subs = len(settings)
+    enabled = sum(1 for st in settings.values() if st["enabled"])
+    new_24 = sum(1 for u in users.values() if now - u.get("joined", 0) < 86400)
+    act_24 = sum(1 for u in users.values() if now - u.get("last_seen", 0) < 86400)
+    act_7 = sum(1 for u in users.values() if now - u.get("last_seen", 0) < 7 * 86400)
+    days = stats["alerts_by_day"]
+    d0 = datetime.now(TZ)
+    week = sum(days.get((d0 - timedelta(days=i)).strftime("%Y-%m-%d"), 0) for i in range(7))
+    top = sorted(stats["alerts_by_ticker"].items(), key=lambda kv: -kv[1])[:5]
+    recent = sorted(users.items(), key=lambda kv: -kv[1].get("joined", 0))[:5]
+
+    def who(cid: str, u: dict) -> str:
+        name = f"@{u['username']}" if u.get("username") else (u.get("name") or cid)
+        return f"{name} ({fmt_ago(u.get('joined', now))} назад)"
+
+    data_age = f"{int(now - last_fetch_ts)}с назад" if last_fetch_ts else "ещё не было"
+    lines = [
+        "📈 <b>Статистика бота</b>",
+        "",
+        "<b>Пользователи</b>",
+        f"Всего: {len(users)} · подписаны: {subs} · алерты вкл.: {enabled}",
+        f"Новых за 24ч: {new_24} · активных за 24ч: {act_24} · за 7 дней: {act_7}",
+        f"Заблокировали бота: {stats.get('blocked', 0)}",
+        "",
+        "<b>Алерты</b> (сообщений)",
+        f"Сегодня: {days.get(today(), 0)} · за 7 дней: {week} · всего: {stats['alerts_total']}",
+    ]
+    if top:
+        lines.append("Чаще всего: " + ", ".join(f"{t.replace('-PERP', '').replace('-SWAP', ' swap')} ({n})" for t, n in top))
+    if recent:
+        lines += ["", "<b>Новые пользователи</b>"] + [who(c, u) for c, u in recent]
+    lines += [
+        "",
+        "<b>Работа бота</b>",
+        f"Аптайм сеанса: {fmt_ago(STARTED_AT)} · опрос раз в {POLL_SECONDS:g}с",
+        f"Данные Variational: {data_age} · рынков: {len(last_listings)}",
+        f"Запросов к API за сеанс: {session_stats['api_ok']} ок / {session_stats['api_err']} ошибок",
+    ]
+    if session_stats["last_err"]:
+        lines.append(f"Последняя ошибка: {session_stats['last_err'][:120]}")
+    return "\n".join(lines)
 
 
 async def apply_changes(m: Message, changes: dict) -> None:
@@ -525,6 +634,17 @@ async def cmd_pair(m: Message, command: CommandObject):
         await m.answer(f"Пары «{command.args}» нет в API Variational.")
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    if not ADMIN_IDS:
+        return await m.answer("Статистика доступна только владельцу. Чтобы включить её, добавь в GitHub секрет "
+                              f"<code>ADMIN_ID</code> со значением <code>{uid}</code> и перезапусти бота.")
+    if uid not in ADMIN_IDS:
+        return
+    await m.answer(fmt_stats())
+
+
 @dp.message(Command("stop"))
 async def cmd_stop(m: Message):
     settings.pop(m.chat.id, None)
@@ -575,8 +695,11 @@ async def poller():
                 listings = await fetch(session)
                 if listings is not None:
                     last_listings, last_fetch_ts = listings, time.time()
+                    session_stats["api_ok"] += 1
                     await process_alerts()
             except Exception as e:  # noqa: BLE001
+                session_stats["api_err"] += 1
+                session_stats["last_err"] = f"{type(e).__name__}: {e}"
                 log.warning("Ошибка опроса: %s", e)
             await asyncio.sleep(POLL_SECONDS)
 
@@ -604,13 +727,16 @@ async def process_alerts():
         more = f"\n…и ещё {len(fresh) - 15}" if len(fresh) > 15 else ""
         try:
             await bot.send_message(chat_id, f"🔔 <b>Низкий спред</b> ({len(fresh)})\n\n{body}{more}")
+            count_alert([r["ticker"] for r in fresh])
         except TelegramForbiddenError:
             # пользователь заблокировал бота — больше ему не пишем
             log.info("Чат %s заблокировал бота, удаляю", chat_id)
             settings.pop(chat_id, None)
             runtime.pop(chat_id, None)
+            stats["blocked"] = stats.get("blocked", 0) + 1
             save_settings()
             save_state()
+            save_stats()
         except Exception as e:  # noqa: BLE001
             log.warning("Не отправил в %s: %s", chat_id, e)
         await asyncio.sleep(0.05)  # не упираться в лимиты Telegram при многих пользователях
@@ -624,6 +750,9 @@ async def main():
         log.info("Публичный режим: ботом может пользоваться любой, у каждого свои фильтры")
     load_settings()
     load_state()
+    load_stats()
+    for cid in settings:   # те, кто подписался до появления статистики
+        stats["users"].setdefault(str(cid), {})
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     asyncio.create_task(poller())
     if RUN_UNTIL:
